@@ -16,7 +16,6 @@ import random
 import time
 import os
 from stable_baselines3.common.buffers import ReplayBuffer
-from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -34,15 +33,16 @@ configs = {
    
    # DDPG
    'gamma': 0.99,
-   'polyak': 0.999,
-   'actor_lr': 1e-4,
-   'critic_lr': 1e-4,
-   'batch_size': 256,
+   'tau': 0.005,
+   'actor_lr': 10e-3,
+   'critic_lr': 10e-3,
+   'batch_size': 100,
    'buffer_size': 1000000,
    'time_steps': 1000000,
-   'learning_start': 25000,
-   'update_every': 50,
-   'exploration_noise': 0.5,
+   'learning_start': 10000,
+   'act_noise': 0.1,
+   'noise_clip': 0.5,
+   'target_noise': 0.2,
    'grad_clip': 0.5,
    'policy_delay': 2,
 }
@@ -59,6 +59,7 @@ def make_env(env_name, seed, run_name, idx, save_video, gamma):
       else:
          env = gym.make(env_name)
       env = gym.wrappers.RecordEpisodeStatistics(env)
+      env = gym.wrappers.NormalizeObservation(env)
       env = gym.wrappers.NormalizeReward(env, gamma=gamma)
       env.action_space.seed(seed)
       env.observation_space.seed(seed)
@@ -70,11 +71,11 @@ class Critic(nn.Module):
    def __init__(self, state_dim, action_dim):
       super(Critic, self).__init__()
       self.sequential = nn.Sequential(
-         nn.Linear(state_dim + action_dim, 256),
+         nn.Linear(state_dim + action_dim, 400),
          nn.ReLU(),
-         nn.Linear(256, 256),
+         nn.Linear(400, 300),
          nn.ReLU(),
-         nn.Linear(256, 1)
+         nn.Linear(300, 1)
       )
    def forward(self, state, action):
       state = state.float()
@@ -84,11 +85,11 @@ class Actor(nn.Module):
    def __init__(self, state_dim, action_dim, action_min, action_max):
       super(Actor, self).__init__()
       self.mean = nn.Sequential(
-         nn.Linear(state_dim, 256),
+         nn.Linear(state_dim, 400),
          nn.ReLU(),
-         nn.Linear(256, 256),
+         nn.Linear(400, 300),
          nn.ReLU(),
-         nn.Linear(256, action_dim),
+         nn.Linear(300, action_dim),
          nn.Tanh()
       )
       # action rescaling
@@ -160,7 +161,6 @@ def main():
    # Pegando as ações maiores e menores
    action_max = envs.single_action_space.high
    action_min = envs.single_action_space.low
-   action_range = (action_max - action_min) / 2.0
    
    # Criando as redes
    qf1 = Critic(state_dim, action_dim).to(device)
@@ -198,7 +198,7 @@ def main():
          with torch.no_grad():   
             action = pi(torch.Tensor(obs).to(device))
             action = action.cpu().numpy()
-            noise = np.random.normal(0, configs['exploration_noise'] * action_range, size=action.shape) 
+            noise = np.random.normal(0, configs['act_noise'], size=action.shape)
             action = np.clip(action + noise, action_min, action_max)
                   
       next_obs, reward, terminated, truncated, infos = envs.step(action)
@@ -219,68 +219,64 @@ def main():
                writer.add_scalar("charts/episodic_length", length, step)
       
       # Atualizando a rede
-      if step >= configs['learning_start'] and step % configs['update_every'] == 0:
-         for update in range(configs['update_every']):
-            batch = buffer.sample(configs['batch_size'])
+      if step >= configs['learning_start']:
+         batch = buffer.sample(configs['batch_size'])
 
-            # Atualização da rede Q
-            with torch.no_grad():
-               next_action = pi_target(batch.next_observations)
-               noise = torch.normal(
-                  mean=0.0,
-                  std=configs['exploration_noise'],
-                  size=next_action.shape,
-                  device=device) * action_range
-               next_action = next_action + noise
-               next_action = torch.clamp(
-                  next_action, 
-                  torch.Tensor(action_min).to(device), 
-                  torch.Tensor(action_max).to(device))
+         # Atualização da rede Q
+         with torch.no_grad():
+            next_action = pi_target(batch.next_observations)
+            noise = torch.normal(0, configs['target_noise'], size=next_action.shape).to(device)
+            noise = noise.clamp(-configs['noise_clip'], configs['noise_clip'])
+            next_action = next_action + noise
+            next_action = torch.clamp(
+               next_action, 
+               torch.Tensor(action_min).to(device), 
+               torch.Tensor(action_max).to(device))
+            
+            next_q1 = qf1_target(batch.next_observations, next_action).flatten()
+            next_q2 = qf2_target(batch.next_observations, next_action).flatten()
+            next_q = torch.min(next_q1, next_q2)
+            
+            target = batch.rewards.flatten() + configs['gamma'] * (1 - batch.dones.flatten()) * next_q
+         
+         current_q1 = qf1(batch.observations, batch.actions).flatten()
+         current_q2 = qf2(batch.observations, batch.actions).flatten()
+         
+         qf1_loss = F.mse_loss(current_q1, target)
+         qf2_loss = F.mse_loss(current_q2, target)
+         qf_loss = qf1_loss + qf2_loss
+         
+         qf_optimizer.zero_grad()
+         qf_loss.backward()
+         torch.nn.utils.clip_grad_norm_(list(qf1.parameters()) + list(qf2.parameters()), configs['grad_clip'])
+         qf_optimizer.step()
+         
+         # Atualização da rede pi
+         if step % configs['policy_delay'] == 0:
+            pi_loss = -qf1(batch.observations, pi(batch.observations)).flatten().mean()
+            pi_optimizer.zero_grad()
+            pi_loss.backward()
+            torch.nn.utils.clip_grad_norm_(pi.parameters(), configs['grad_clip'])
+            pi_optimizer.step()
+            
+            # Atualizando as redes target
+            for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+               target_param.data.copy_((1 - configs['tau']) * target_param.data + configs['tau'] * param.data)
                
-               next_q1 = qf1_target(batch.next_observations, next_action).flatten()
-               next_q2 = qf2_target(batch.next_observations, next_action).flatten()
-               next_q = torch.min(next_q1, next_q2)
-               
-               target = batch.rewards.flatten() + configs['gamma'] * (1 - batch.dones.flatten()) * next_q
+            for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+               target_param.data.copy_((1 - configs['tau']) * target_param.data + configs['tau'] * param.data)
             
-            current_q1 = qf1(batch.observations, batch.actions).flatten()
-            current_q2 = qf2(batch.observations, batch.actions).flatten()
-            
-            qf1_loss = F.mse_loss(current_q1, target)
-            qf2_loss = F.mse_loss(current_q2, target)
-            qf_loss = qf1_loss + qf2_loss
-            
-            qf_optimizer.zero_grad()
-            qf_loss.backward()
-            torch.nn.utils.clip_grad_norm_(list(qf1.parameters()) + list(qf2.parameters()), configs['grad_clip'])
-            qf_optimizer.step()
-            
-            # Atualização da rede pi
-            if update % configs['policy_delay'] == 0:
-               pi_loss = -qf1(batch.observations, pi(batch.observations)).flatten().mean()
-               pi_optimizer.zero_grad()
-               pi_loss.backward()
-               torch.nn.utils.clip_grad_norm_(pi.parameters(), configs['grad_clip'])
-               pi_optimizer.step()
-               
-               # Atualizando as redes target
-               for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
-                  target_param.data.copy_(configs['polyak'] * target_param.data + (1 - configs['polyak']) * param.data)
-                  
-               for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
-                  target_param.data.copy_(configs['polyak'] * target_param.data + (1 - configs['polyak']) * param.data)
-               
-               for param, target_param in zip(pi.parameters(), pi_target.parameters()):
-                  target_param.data.copy_(configs['polyak'] * target_param.data + (1 - configs['polyak']) * param.data)
-            
-            # Atualizando o melhor modelo
-            if qf_loss.item() < best_qf_loss:
-               torch.save(qf1.state_dict(), f"models/{run_name}/qf1.pth")
-               torch.save(qf2.state_dict(), f"models/{run_name}/qf2.pth")
-               best_qf_loss = qf_loss.item()
-            if pi_loss.item() < best_pi_loss:
-               torch.save(pi.state_dict(), f"models/{run_name}/pi.pth")
-               best_pi_loss = pi_loss.item()
+            for param, target_param in zip(pi.parameters(), pi_target.parameters()):
+               target_param.data.copy_((1 - configs['tau']) * target_param.data + configs['tau'] * param.data)
+         
+         # Atualizando o melhor modelo
+         if qf_loss.item() < best_qf_loss:
+            torch.save(qf1.state_dict(), f"models/{run_name}/qf1.pth")
+            torch.save(qf2.state_dict(), f"models/{run_name}/qf2.pth")
+            best_qf_loss = qf_loss.item()
+         if pi_loss.item() < best_pi_loss:
+            torch.save(pi.state_dict(), f"models/{run_name}/pi.pth")
+            best_pi_loss = pi_loss.item()
 
          # Atualizando o writer
          if configs['track']:
