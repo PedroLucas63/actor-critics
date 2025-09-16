@@ -203,6 +203,9 @@ def main():
       # Registrando os dados
       buffer.add(obs, next_obs, action, reward, done, [infos])
       
+      # Atualizando o estado
+      obs = next_obs
+      
       # Registrando possíveis resultados (episódios que terminaram)
       if "episode" in infos and configs['track']:
          for reward, length in zip(infos["episode"]["r"], infos["episode"]["l"]):

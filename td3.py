@@ -31,7 +31,7 @@ configs = {
    'save_video': True,
    'torch_deterministic': True,
    
-   # DDPG
+   # TD3
    'gamma': 0.99,
    'tau': 0.005,
    'actor_lr': 10e-3,
@@ -206,6 +206,9 @@ def main():
       
       # Registrando os dados
       buffer.add(obs, next_obs, action, reward, done, [infos])
+      
+      # Atualizando o estado
+      obs = next_obs
       
       # Registrando possíveis resultados (episódios que terminaram)
       if "episode" in infos and configs['track']:
