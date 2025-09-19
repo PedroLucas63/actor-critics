@@ -19,11 +19,13 @@ configs = {
    'env_name': 'HalfCheetah-v5',
    'file_name': 'sac',
    'envs': 1,
-   'seed': 3,
+   'seed': 5,
    'cuda': True,
    'track': True,
    'save_video': True,
    'torch_deterministic': True,
+   'test_every': 1000,
+   'test_episodes': 10,
    
    # SAC
    'gamma': 0.99,
@@ -31,28 +33,27 @@ configs = {
    'actor_lr': 10e-3,
    'critic_lr': 10e-3,
    'batch_size': 100,
-   'buffer_size': 1000000,
-   'time_steps': 1000000,
+   'buffer_size': 100000,
+   'time_steps': 100000,
    'learning_start': 10000,
-   'update_every': 50,
+   'update_every': 1,
    'grad_clip': 0.5,
-   'alpha': 0.2
+   'alpha': 0.01,
+   'alpha_tunning': False,
 }
 
 # Run name
 run_name = f"{configs['file_name']}_{configs['env_name']}_{time.strftime('%Y%m%d-%H%M%S')}"
 
 # Definindo a função de ambiente
-def make_env(env_name, seed, run_name, idx, save_video, gamma):
+def make_env(env_name, seed, run_name, idx, save_video):
    def thunk():
       if save_video and idx == 0:
          env = gym.make(env_name, render_mode='rgb_array')
-         env = gym.wrappers.RecordVideo(env, f'videos/{run_name}')
+         env = gym.wrappers.RecordVideo(env, f'videos/{run_name}', episode_trigger=lambda x: x % 100 == 0)
       else:
          env = gym.make(env_name)
       env = gym.wrappers.RecordEpisodeStatistics(env)
-      env = gym.wrappers.NormalizeObservation(env)
-      env = gym.wrappers.NormalizeReward(env, gamma=gamma)
       env.action_space.seed(seed)
       env.observation_space.seed(seed)
       return env
@@ -112,23 +113,27 @@ class Actor(nn.Module):
       
       return mean, log_std
 
-   def get_action(self, state):
+   def get_action(self, state, train=True):
       # Pegando a média e variância
       mean, log_std = self.forward(state)
       std = log_std.exp()
-      
-      # Criando a distribuição normal
-      normal = Normal(mean, std)
-      z = normal.rsample() # Amostragem do Z sem perda da diferenciabilidade
-      y = torch.tanh(z) # Aplicando a função tanh para garantir que a ação esteja entre -1 e 1
-      action = y * self.action_scale + self.action_bias # Reescalando a ação
-      
-      # Correção da ação
-      log_prob = normal.log_prob(z) # Calculando o log_prob
-      log_prob -= torch.log(self.action_scale * (1 - y.pow(2)) + 1e-6) # Correção do log_prob
-      log_prob = log_prob.sum(1, keepdim=True) # Somando as probabilidades logarítmicas
-      
-      return action, log_prob
+      if train:
+         # Criando a distribuição normal
+         normal = Normal(mean, std)
+         z = normal.rsample() # Amostragem do Z sem perda da diferenciabilidade
+         y = torch.tanh(z) # Aplicando a função tanh para garantir que a ação esteja entre -1 e 1
+         action = y * self.action_scale + self.action_bias # Reescalando a ação
+         
+         # Correção da ação
+         log_prob = normal.log_prob(z) # Calculando o log_prob
+         log_prob -= torch.log(self.action_scale * (1 - y.pow(2)) + 1e-6) # Correção do log_prob
+         log_prob = log_prob.sum(1, keepdim=True) # Somando as probabilidades logarítmicas
+         
+         return action, log_prob
+      else:
+         y = torch.tanh(mean)
+         action = y * self.action_scale + self.action_bias
+         return action
    
 # Função principal
 def main():
@@ -168,9 +173,17 @@ def main():
          configs['seed'], 
          run_name, 
          i, 
-         configs['save_video'],
-         configs["gamma"]
+         False,
       ) for i in range(configs['envs'])])
+   
+   # Ambiente para testes
+   test_env = make_env(
+      configs['env_name'], 
+      configs['seed'] + 100, 
+      run_name, 
+      0, 
+      configs['save_video'],
+   )()
 
    # Resetando os ambientes
    obs, _ = envs.reset()
@@ -205,10 +218,28 @@ def main():
       device=device
    )
    
+   # Definindo o alpha para tunning
+   if configs['alpha_tunning']:
+      target_entropy = -np.prod(envs.single_action_space.shape).item()
+      log_alpha = torch.zeros(1, requires_grad=True, device=device)
+      alpha_optimizer = optim.Adam([log_alpha], lr=configs['actor_lr'])
+      alpha = log_alpha.exp().item()
+   else:
+      alpha = configs['alpha']
+   
    # Definindo o progresso
    progress = tqdm(range(configs['time_steps']), desc='Steps')
+   # Inicializa com todos os campos
+   postfix_data = {
+      "EpisodicReturn": None,
+      "TestEpisodicReturn": None
+   }
+   progress.set_postfix(postfix_data)
    
    for step in progress:
+      # Definindo que é um treino
+      pi.train()
+      
       # Pegando a ação
       if step < configs['learning_start']:
          action = envs.action_space.sample()
@@ -229,11 +260,13 @@ def main():
          for reward, length in zip(info["episode"]["r"], info["episode"]["l"]):
             if reward and length:               
                # Log to console
-               progress.set_description(f"Global Step: {step}, Episodic Return: {reward:.2f}")
+               postfix_data['EpisodicReturn'] = reward
+               progress.set_postfix(postfix_data)
                
                # Log to TensorBoard
-               writer.add_scalar("charts/episodic_return", reward, step)
-               writer.add_scalar("charts/episodic_length", length, step)
+               if configs['track']:
+                  writer.add_scalar("charts/episodic_return", reward, step)
+                  writer.add_scalar("charts/episodic_length", length, step)
 
       # Atualizando o estado
       obs = next_obs
@@ -254,7 +287,7 @@ def main():
                target_q2_value = target_qf2(batch.next_observations, next_action).flatten()
                
                # Pega a menor Q para reduzir o viés de superestimação
-               target_q_value = torch.min(target_q1_value, target_q2_value) - configs['alpha'] * next_log_prob
+               target_q_value = torch.min(target_q1_value, target_q2_value) - alpha * next_log_prob
                
                # Define o alvo do Q
                q_target = batch.rewards.flatten() + (1 - batch.dones.flatten()) * configs['gamma'] * target_q_value
@@ -285,13 +318,24 @@ def main():
             q_new_action = torch.min(q1_new_action, q2_new_action)
             
             # Calculando a loss da política
-            pi_loss = (configs['alpha'] * log_prob - q_new_action).mean()
+            pi_loss = (alpha * log_prob - q_new_action).mean()
             
             # Atualizando a política
             pi_optimizer.zero_grad()
             pi_loss.backward()
             torch.nn.utils.clip_grad_norm_(pi.parameters(), configs['grad_clip'])
             pi_optimizer.step()
+            
+            # Atualizando o alpha para tunning
+            if configs['alpha_tunning']:
+               # Calculando a loss do alpha
+               alpha_loss = -(log_alpha.exp() * (log_prob + target_entropy).detach()).mean()
+               
+               # Atualizando o alpha
+               alpha_optimizer.zero_grad()
+               alpha_loss.backward()
+               alpha_optimizer.step()
+               alpha = log_alpha.exp().item()
             
             # Atualizando os modelos target
             for param, target_param in zip(qf1.parameters(), target_qf1.parameters()):
@@ -314,9 +358,39 @@ def main():
                writer.add_scalar("losses/qf_loss", qf_loss.item(), step)
                writer.add_scalar("losses/pi_loss", pi_loss.item(), step)
                writer.add_scalar("charts/log_prob", log_prob.mean().item(), step)
-   
+               writer.add_scalar("charts/alpha", alpha, step)
+
+      # Testando a política
+      if step % configs['test_every'] == 0:
+         pi.eval()
+         rewards = []
+         for _ in range(configs['test_episodes']):
+            test_obs, _ = test_env.reset()
+            test_done = False
+            test_episode_return = 0
+            
+            while not test_done:
+               with torch.no_grad():
+                  test_action = pi.get_action(torch.tensor(test_obs, device=device), train=False)
+                  test_action = test_action.cpu().numpy()
+               test_obs, test_reward, test_terminated, test_truncated, _ = test_env.step(test_action)
+               test_done = test_terminated or test_truncated
+               test_episode_return += test_reward
+            
+            # Guarda o retorno do episódio
+            rewards.append(test_episode_return)
+            
+         # Calcula o retorno médio
+         avg_reward = np.mean(rewards)
+         
+         # Atualizando o log e writer
+         postfix_data['TestEpisodicReturn'] = avg_reward
+         progress.set_postfix(postfix_data)
+         if configs['track']:
+            writer.add_scalar("charts/test_episodic_return",avg_reward , step)
    # Fechando ambientes
    envs.close()
+   test_env.close()
 
 # Rodando a função principal
 if __name__ == "__main__":
